@@ -1,0 +1,18 @@
+[project]
+name = "auto_loot_bl1e"
+version = "0.1.30"
+authors = [{ name = "galqawala" }]
+description = """\
+Automatically picks up weapons, shields, grenade mods, class mods, artifacts \
+and SDUs, with configurable options. A from-scratch BL1E (Willow1) port of \
+AutoLoot's feature set - not compatible with and does not replace AutoLoot \
+(BL2/TPS).
+"""
+dependencies = ["ui_utils"]
+
+[tool.sdkmod]
+name = "AutoLootBL1E"
+version = "0.1.30"
+supported_games = ["BL1E"]
+license = {name = "GPL3", url = "https://choosealicense.com/licenses/gpl-3.0/" }
+download = "https://github.com/galqawala/AutoLootBL1E/raw/refs/heads/master/AutoLootBL1E.sdkmod"
