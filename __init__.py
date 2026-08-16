@@ -88,6 +88,7 @@ next_near_loot_report = 0.0
 last_shown_body = None
 fire_held = False
 picking_up = False
+warned_remote_client = False
 _recent_log_messages: dict[str, float] = {}
 
 
@@ -193,8 +194,16 @@ EQUIPLOC_SHIELD = 0
 EQUIPLOC_GRENADE_MOD = 1
 EQUIPLOC_CLASS_MOD = 2
 
-ARTIFACT_PACKAGE_PREFIX = "gd_ElementalUpgrade."
-SDU_PACKAGE_PREFIX = "gd_StorageDeckUpgrade."
+# str(ItemDefinition_instance) renders as "ItemDefinition'package.group.object'"
+# (the same ClassName'Package...' format AutoContainerMod's own TREASURE_
+# PACKAGE_PREFIXES already includes the class name for) - these were missing
+# that "ItemDefinition'" segment, so path.startswith() below never matched
+# anything and item_kind() silently returned None for every artifact and SDU,
+# for both pickup and auto-use, the whole time. Confirmed via BL1E's own
+# Localization/INT/gd_StorageDeckUpgrade.INT (Backpack SDU's ItemDefinition
+# is INV_InventorySpace.INV_InventorySpace in that package).
+ARTIFACT_PACKAGE_PREFIX = "ItemDefinition'gd_ElementalUpgrade."
+SDU_PACKAGE_PREFIX = "ItemDefinition'gd_StorageDeckUpgrade."
 
 KIND_WEAPON = "Weapon"
 KIND_SHIELD = "Shield"
@@ -486,13 +495,20 @@ def use_backpack_extras(caller):
     for item in list(inventory_manager.Backpack):
         try:
             kind = item_kind(item)
-            if kind == KIND_ARTIFACT and not auto_use_artifacts.value:
-                continue
-            if kind == KIND_SDU and not auto_use_sdus.value:
-                continue
             if kind not in (KIND_ARTIFACT, KIND_SDU):
                 continue
+            if kind == KIND_ARTIFACT and not auto_use_artifacts.value:
+                logging.info(f"[AutoLootBL1E] not auto-using {comparison_group(item)} - option is off")
+                continue
+            if kind == KIND_SDU and not auto_use_sdus.value:
+                logging.info(f"[AutoLootBL1E] not auto-using {comparison_group(item)} - option is off")
+                continue
             inventory_manager.ReadyBackpackInventory(item)
+            still_present = item in inventory_manager.Backpack
+            logging.info(
+                f"[AutoLootBL1E] auto-use {comparison_group(item)}:"
+                f" ReadyBackpackInventory called, still_in_backpack={still_present}"
+            )
         except Exception as ex:  # noqa: BLE001
             logging.warning(f"[AutoLootBL1E] could not use {item_kind(item)}: {ex!r}")
 
@@ -654,6 +670,71 @@ def refill_dry_backup_slots(caller):
             signatures[slot] = weapon_signature(chosen)
         except Exception as ex:  # noqa: BLE001
             logging.warning(f"[AutoLootBL1E] could not refill backup slot {slot}: {ex!r}")
+
+
+def diversify_equipped_elements(caller):
+    """Swap one of a pair of equipped weapons sharing an element for a fresh one.
+
+    Ported from willow2_mods/AutoLoot (this was meant to already be part of
+    this port - it was missed). Same algorithm, unchanged: non-elemental
+    counts as its own element here - item_element already returns the same
+    None for every non-elemental weapon, so two plain weapons equipped
+    together count as "sharing an element" exactly like two Fire weapons
+    would, with no special-casing needed. Never touches the active slot, for
+    the same reason refill_dry_backup_slots does not.
+
+    Only difference from the Willow2 version: the log message uses
+    comparison_group() instead of item_kind() for the weapon type name -
+    BL1E's item_kind() means something else entirely here (shield/mod/
+    artifact/SDU classification, see item_kind's own docstring), and
+    comparison_group() is this port's equivalent of what Willow2's item_kind
+    already returns for weapons (an ammo/type label like "Sniper Rifle").
+    """
+    if not auto_equip.value:
+        return
+
+    inventory_manager = caller.GetPawnInventoryManager()
+    if inventory_manager is None:
+        return
+
+    pawn = caller.Pawn
+    current = None if pawn is None else pawn.Weapon
+    current_slot = None if current is None else int(getattr(current, "QuickSelectSlot", 0))
+
+    by_slot = equipped_weapons(caller)
+    elements = {slot: item_element(weapon) for slot, weapon in by_slot.items()}
+    by_element = {}
+    for slot, element in elements.items():
+        by_element.setdefault(element, []).append(slot)
+
+    for slots in by_element.values():
+        if len(slots) < 2:
+            continue
+        replaceable = [slot for slot in slots if slot != current_slot]
+        if not replaceable:
+            continue
+        # Random rather than always the same slot in the pair, so which one
+        # gets swapped is not permanently biased toward e.g. the lowest slot
+        # number.
+        slot = random.choice(replaceable)
+        try:
+            other_elements = {e for s, e in elements.items() if s != slot}
+            fresh = [
+                item
+                for item in loaded_backpack_weapons(caller, inventory_manager)
+                if item_element(item) not in other_elements
+            ]
+            if not fresh:
+                continue
+            chosen = random.choice(fresh)
+            old_group = comparison_group(by_slot[slot])
+            inventory_manager.ReadyBackpackInventory(chosen, slot)
+            logging.warning(
+                f"[AutoLootBL1E] slot {slot}: {old_group} -> {comparison_group(chosen)},"
+                " no longer sharing an element with another slot"
+            )
+        except Exception as ex:  # noqa: BLE001
+            logging.warning(f"[AutoLootBL1E] could not diversify slot {slot}: {ex!r}")
 
 
 def manage_weapon_ammo(caller):
@@ -843,14 +924,26 @@ def character_level(caller):
     return level if level > 0 else None
 
 
-def item_price(item) -> int:
+def item_price(item, caller) -> int:
+    """This item's sell value, i.e. GetSellingPriceForInventory(item).
+
+    Not a method on the item itself - BL1E has no GetMonetaryValue anywhere
+    (confirmed absent from the whole class dump; this was carried over from
+    AutoLoot's Willow2 source without being checked against BL1E's own
+    classes and failed on every single call). The real function is declared
+    natively on WillowPawn (WillowPawn.uc), taking the item as an argument -
+    the same call the inventory screen's own sell-value display uses.
+    """
+    pawn = caller.Pawn
+    if pawn is None:
+        return 0
     try:
-        return int(item.GetMonetaryValue())
+        return int(pawn.GetSellingPriceForInventory(item))
     except Exception as ex:  # noqa: BLE001
         # Falling back to 0 makes this item look free, i.e. the cheapest
         # possible candidate - worth knowing about since that would bias it
         # straight to the front of the "worst item" comparison every time.
-        logging.warning(f"[AutoLootBL1E] GetMonetaryValue failed on {comparison_group(item)}: {ex!r}")
+        logging.warning(f"[AutoLootBL1E] GetSellingPriceForInventory failed on {comparison_group(item)}: {ex!r}")
         return 0
 
 
@@ -1027,7 +1120,9 @@ def choose_worst_item(candidates, cap, caller, log=False, now=None):
             trace.append(f"rarity {rarity}")
 
     if len(candidates) > 1:
-        candidates, price = _tied_for_extreme(candidates, item_price, pick_max=False)
+        candidates, price = _tied_for_extreme(
+            candidates, lambda item: item_price(item, caller), pick_max=False
+        )
         if log:
             trace.append(f"price ${price}")
 
@@ -1187,8 +1282,30 @@ def attempt_pickup(caller, pickup) -> bool:
     if inventory_manager is None:
         logging.warning(f"[AutoLootBL1E] no inventory manager, cannot pick up {comparison_group(pickup.Inventory)}")
         return False
+    game = caller.WorldInfo.Game
+    if game is None:
+        # WorldInfo.Game is only ever populated on the server - confirmed in
+        # WillowPlayerController.uc: the game's own pickup flow
+        # (ServerPickupSomething/AllPlayersPickupQuery) is a `reliable server
+        # function` specifically so its own PickupQuery call always runs
+        # where Game is valid. On a remote multiplayer client (not the host)
+        # Game is always None here, and this used to throw AttributeError on
+        # every single pickup attempt - once per candidate per scan tick,
+        # spamming the log. Auto-pickup only works for the host until this
+        # has a real server-RPC path; logged once, not every tick, since
+        # nothing about this changes tick to tick.
+        global warned_remote_client
+        if not warned_remote_client:
+            warned_remote_client = True
+            logging.warning(
+                "[AutoLootBL1E] this player is a remote client, not the host -"
+                " WorldInfo.Game is never available here, so auto-pickup/drop"
+                " cannot run. Manual pickup is unaffected. (Not logged again"
+                " this session.)"
+            )
+        return False
     try:
-        allowed = caller.WorldInfo.Game.PickupQuery(caller.Pawn, pickup)
+        allowed = game.PickupQuery(caller.Pawn, pickup)
     except Exception as ex:  # noqa: BLE001
         logging.warning(f"[AutoLootBL1E] PickupQuery failed: {ex!r}")
         return False
@@ -1278,6 +1395,7 @@ def player_tick(obj, _args, _ret, _func):
         # the dry-weapon logic below on this same pass.
         fill_empty_equip_slots(obj)
         refill_dry_backup_slots(obj)
+        diversify_equipped_elements(obj)
         manage_weapon_ammo(obj)
     except Exception as ex:  # noqa: BLE001
         logging.warning(f"[AutoLootBL1E] could not manage equipment: {ex!r}")
