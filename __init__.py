@@ -138,6 +138,18 @@ auto_use_sdus = BoolOption(
     True,
     description="Use Storage Deck Upgrades as soon as picked up - always beneficial.",
 )
+auto_use_healing_kit_at_health_percent = SliderOption(
+    "Heal Kit At HP %",
+    50,
+    0,
+    100,
+    5,
+    True,
+    description=(
+        "Use a carried Healing Kit from your backpack when your health drops"
+        " to this % or below. 0 disables."
+    ),
+)
 auto_equip = BoolOption(
     "Auto Equip",
     True,
@@ -511,6 +523,81 @@ def use_backpack_extras(caller):
             )
         except Exception as ex:  # noqa: BLE001
             logging.warning(f"[AutoLootBL1E] could not use {item_kind(item)}: {ex!r}")
+
+
+# "Healing Kit" tiers (HealthPack_1..5) - a carryable backpack item, distinct
+# from the small instant-consume "Insta-Health Vial" pickups (HealthVial_1..5,
+# which are never routed through here at all and never sit in the backpack -
+# see AutopickupBL1E, which already picks both families up on the ground).
+# Confirmed in gd_HealthDrops.INT: "Can be carried in your Storage Deck."
+# Deliberately NOT wired into item_kind()/KIND_* - a Healing Kit should never
+# become a drop-when-full candidate or participate in the worst-item
+# comparison; the player is keeping it as an emergency reserve, not loot to
+# manage.
+HEALTH_KIT_NAMES = frozenset((
+    "HealthPack_1",
+    "HealthPack_2",
+    "HealthPack_3",
+    "HealthPack_4",
+    "HealthPack_5",
+))
+
+
+def is_health_kit(item) -> bool:
+    if item is None or item.Class is None or item.Class.Name != "WillowUsableItem":
+        return False
+    item_def = item_definition_of(item)
+    return item_def is not None and str(item_def.Name) in HEALTH_KIT_NAMES
+
+
+def maybe_use_healing_kit(caller):
+    """Use one carried Healing Kit when health drops to the configured % or below.
+
+    0 disables - one control expressing off, rather than a separate enable
+    checkbox, per this codebase's own convention.
+
+    GetHealth()/GetMaxHealth() are native Engine.Pawn functions the game's
+    own HUD calls every frame for the health bar - about as safe a native
+    call as exists in this engine, unlike the rarer ones elsewhere in this
+    file that get extra caution and comments.
+    """
+    threshold = auto_use_healing_kit_at_health_percent.value
+    if threshold <= 0:
+        return
+
+    pawn = caller.Pawn
+    if pawn is None:
+        return
+    try:
+        health = pawn.GetHealth()
+        max_health = pawn.GetMaxHealth()
+    except Exception as ex:  # noqa: BLE001
+        logging.warning(f"[AutoLootBL1E] could not read health: {ex!r}")
+        return
+    if max_health <= 0 or health >= max_health:
+        # No point healing at full health regardless of the threshold - this
+        # also stops threshold=100 (the slider's own max) from firing on
+        # every single scan forever, since health is always <=100% of itself.
+        return
+    if (health / max_health * 100) > threshold:
+        return
+
+    inventory_manager = caller.GetPawnInventoryManager()
+    if inventory_manager is None:
+        return
+
+    for item in list(inventory_manager.Backpack):
+        if not is_health_kit(item):
+            continue
+        try:
+            inventory_manager.ReadyBackpackInventory(item)
+            logging.info(
+                f"[AutoLootBL1E] auto-used a Healing Kit at"
+                f" {health:.0f}/{max_health:.0f} health ({threshold}% threshold)"
+            )
+        except Exception as ex:  # noqa: BLE001
+            logging.warning(f"[AutoLootBL1E] could not auto-use Healing Kit: {ex!r}")
+        return  # one at a time - re-check health next scan before using another
 
 
 WEAPON_SLOTS = (1, 2, 3, 4)
@@ -976,18 +1063,210 @@ def item_element(item):
         return damage_type
 
 
-def item_rarity(item):
-    """This item's rarity tier - a plain field on WillowInventory, always set
-    by ComputeValueOfParts (WillowWeapon.uc) / the equivalent on WillowItem.uc
-    for every real item of a kind this mod tracks - so a missing attribute
-    here means something is wrong with the item, not a legitimate "no
-    rarity" case. Asserts rather than silently defaulting, per the
-    should-never-be-None rule: a real item with no readable RarityLevel is
-    exactly the class of bug that rule exists to surface loudly.
+# --- GearScore ---------------------------------------------------------
+# Ported from eeriegoesd's GearScore mod
+# (https://bl-sdk.github.io/willow1-mod-db/mods/gearscore/, GPL-3.0-or-later)
+# to rank a group of same-kind, same-level-bracket, same-element candidates
+# by quality, replacing a plain rarity-tier comparison. Credit: eeriegoesd,
+# https://eeriegoesd.com/gaming/mods/.
+#
+# Two deliberate differences from the original, both because this score is
+# computed on every drop-decision scan rather than only when a UI card is
+# open, which is the GearScore mod's own only trigger:
+#   1. Element is read via item_element() (a plain attribute chain already
+#      proven working elsewhere in this file) instead of GearScore's own
+#      read_element(), which calls the native StaticGetWeaponDamageType -
+#      avoids one native call entirely, per this codebase's own preference
+#      for a plain attribute read over a native call wherever one exists.
+#   2. Accuracy and critical-hit bonus are always disregarded (GearScore's
+#      own defaults) since there is no item-card UI here to read them from.
+#
+# Everything else, including GearScore's one remaining native call -
+# StaticCalculateWeaponTechLevelForUI, for a backpack weapon's elemental proc
+# level, which has no plain-attribute equivalent (TechLevel itself only
+# reflects the currently EQUIPPED weapon's live tech pool) - is a faithful,
+# unchanged port. GearScore already calls this same function across many
+# backpack weapons at once, in this same game, in its own published DPS-sort
+# backpack page - the closest thing to in-game verification available without
+# running the game directly, but still worth watching if a crash is ever seen
+# near a drop decision.
+
+# Elements measured against plain flesh, the surface with no resistance
+# either way - matches GearScore's own FLESH_SURFACE assumption. Keyed by
+# item_element()'s own DamageType ints (WillowDamageTypeDefinition.EDamageType)
+# rather than GearScore's element-name strings.
+GEARSCORE_ELEMENT_SPLASH = {
+    1: 0.6,  # Incindiary
+    2: 1.0,  # Shock
+    3: 1.5,  # Explosive
+    4: 0.4,  # Corrosive
+}
+
+# What the game calls each sort of gun, and what the cheapest elemental
+# splash costs from its tech pool / how hard it hits - both straight from
+# GearScore's own FAMILY_NAMES/PROC_TABLE.
+GEARSCORE_FAMILY_NAMES = {
+    "repeater": ("repeater", "machine_pistol"),
+    "revolver": ("revolver",),
+    "smg": ("smg",),
+    "shotgun": ("shotgun",),
+    "rifle": ("combat_rifle",),
+    "sniper": ("sniper",),
+}
+GEARSCORE_PROC_TABLE = {
+    "repeater": (4.0, 1.0),
+    "revolver": (0.0, 1.0),
+    "smg": (12.0, 1.0),
+    "shotgun": (20.0, 1.0),
+    "rifle": (20.0, 1.0),
+    "sniper": (32.0, 1.0),
+}
+GEARSCORE_POOL_REFILL = 4.0  # How fast the tech pool refills, same for every gun.
+
+# Seconds of fighting the shield score is measured over - GearScore's own
+# SHIELD_WINDOW.
+GEARSCORE_SHIELD_WINDOW = 60.0
+
+GEARSCORE_SHIELD_DEFINITION = "gd_shields.A_Item.Item_Shield"
+GEARSCORE_DELAY_ATTRIBUTE = "d_attributes.ShieldResourcePool.ShieldOnIdleRegenerationDelay"
+_gearscore_shield_delay_patched = False
+
+
+def _patch_gearscore_shield_delay() -> None:
+    """One-time patch so a shield's recharge DELAY is readable at all.
+
+    Shields only expose capacity and recharge RATE through their normal
+    UIStats slot list - the delay needs its own attribute wired into a spare
+    slot first, same as GearScore's own patch_shield_delay(). Idempotent and
+    global (patches the shared ItemDefinition once, not per-item), the same
+    ObjectFlags|=0x4000 definition-patch pattern the original BL1 Autopickup
+    SDK mod already used successfully in this exact game.
     """
-    rarity = getattr(item, "RarityLevel", None)
-    assert rarity is not None, f"RarityLevel missing on {comparison_group(item)}"
-    return rarity
+    global _gearscore_shield_delay_patched
+    if _gearscore_shield_delay_patched:
+        return
+    try:
+        unrealsdk.load_package(GEARSCORE_SHIELD_DEFINITION)
+        definition = unrealsdk.find_object("ItemDefinition", GEARSCORE_SHIELD_DEFINITION)
+        attribute = unrealsdk.find_object("ResourcePoolAttributeDefinition", GEARSCORE_DELAY_ATTRIBUTE)
+        definition.ObjectFlags |= 0x4000
+        definition.UIStats[2].Attribute = attribute
+        _gearscore_shield_delay_patched = True
+    except Exception as ex:  # noqa: BLE001
+        logging.warning(f"[AutoLootBL1E] could not expose shield recharge delay for scoring: {ex!r}")
+
+
+def _gearscore_read(item, name: str, fallback: float) -> float:
+    value = getattr(item, name, None)
+    if value is None or not isinstance(value, (int, float)) or isinstance(value, bool):
+        return fallback
+    return float(value)
+
+
+def _gearscore_family(weapon) -> str | None:
+    try:
+        kind = str(weapon.DefinitionData.WeaponTypeDefinition.Name).lower()
+    except Exception:  # noqa: BLE001
+        return None
+    for family, needles in GEARSCORE_FAMILY_NAMES.items():
+        for needle in needles:
+            if needle in kind:
+                return family
+    return None
+
+
+def _gearscore_proc_level(weapon) -> int:
+    """The x1 to x4 elemental splash rating GearScore reads off the card."""
+    try:
+        level = int(weapon.StaticCalculateWeaponTechLevelForUI(weapon.DefinitionData)[0])
+    except Exception:  # noqa: BLE001
+        return 1
+    return min(max(level, 1), 4)
+
+
+def _gearscore_element_dps(weapon, shots_per_second: float) -> float:
+    element = item_element(weapon)
+    family = _gearscore_family(weapon)
+    if element not in GEARSCORE_ELEMENT_SPLASH or family is None:
+        return 0.0
+
+    cost, proc_multiplier = GEARSCORE_PROC_TABLE[family]
+    damage = _gearscore_read(weapon, "InstantHitDamage", 0)
+    level = _gearscore_proc_level(weapon)
+
+    procs = shots_per_second if cost <= 0 else min(GEARSCORE_POOL_REFILL / cost, shots_per_second)
+    return procs * damage * GEARSCORE_ELEMENT_SPLASH[element] * proc_multiplier * level
+
+
+def _gearscore_dps(weapon) -> float | None:
+    """Damage per second over a full magazine, including the reload after it."""
+    damage = _gearscore_read(weapon, "InstantHitDamage", 0)
+    projectiles = _gearscore_read(weapon, "ProjectilesPerShot", 1)
+    fire_interval = _gearscore_read(weapon, "FireInterval", 0)
+    clip_size = _gearscore_read(weapon, "ClipSize", 0)
+    shot_cost = _gearscore_read(weapon, "ShotCost", 1)
+    reload_time = _gearscore_read(weapon, "ReloadTime", 0)
+
+    if damage <= 0 or fire_interval <= 0:
+        return None
+
+    shot_damage = damage * max(projectiles, 1)
+    shots = clip_size / max(shot_cost, 1)
+
+    if shots < 1:
+        span = fire_interval
+    else:
+        burst = _gearscore_read(weapon, "AutomaticBurstCount", 0)
+        pauses = 0.0 if burst <= 0 else -(-shots // burst) * fire_interval
+        span = shots * fire_interval + pauses + reload_time
+
+    rounds = max(shots, 1)
+    bullets = rounds * shot_damage / span
+    return bullets + _gearscore_element_dps(weapon, rounds / span)
+
+
+def _gearscore_ui_stats(item) -> dict[str, float]:
+    """Shields keep their numbers in a list rather than plain properties."""
+    stats: dict[str, float] = {}
+    try:
+        definition = item.DefinitionData.ItemDefinition
+        for index, modifier in enumerate(item.UIStatModifiers):
+            name = str(definition.UIStats[index].Attribute).rsplit(".", 1)[-1].rstrip("'")
+            stats[name] = float(modifier.ModifierTotal)
+    except Exception:  # noqa: BLE001
+        return stats
+    return stats
+
+
+def _gearscore_shield_score(item) -> float | None:
+    """Damage a shield soaks over a minute: its capacity plus everything it recharges."""
+    _patch_gearscore_shield_delay()
+    stats = _gearscore_ui_stats(item)
+    capacity = stats.get("ShieldMaxValue")
+    rate = stats.get("ShieldOnIdleRegenerationRate")
+    if capacity is None or rate is None:
+        return None
+    delay = stats.get("ShieldOnIdleRegenerationDelay", 0.0)
+    return capacity + rate * max(GEARSCORE_SHIELD_WINDOW - delay, 0)
+
+
+def item_gearscore(item) -> float:
+    """How good a thing is - the WORST (lowest score) is the one to drop.
+
+    Weapons score by expected DPS, shields by how much damage they soak in a
+    minute, everything else (grenade mods, class mods, artifacts, SDUs)
+    scores 0.0 - GearScore does not rate those either, so this step provides
+    no differentiation for them and the funnel falls through to the price
+    tiebreak below, same as a genuine tie would anywhere else in this chain.
+    """
+    kind = item_kind(item)
+    if kind == KIND_WEAPON:
+        score = _gearscore_dps(item)
+        return 0.0 if score is None else score
+    if kind == KIND_SHIELD:
+        score = _gearscore_shield_score(item)
+        return 0.0 if score is None else score
+    return 0.0
 
 
 def is_favorite(item) -> bool:
@@ -1095,6 +1374,8 @@ def choose_worst_item(candidates, cap, caller, log=False, now=None):
         over_level = [item for item in candidates if (item_level(item, caller) or 0) > cap]
         usable = [item for item in candidates if (item_level(item, caller) or 0) <= cap]
         if over_level and usable:
+            # Tied -> the overlevel (unusable) group, not usable - matches
+            # step 4 below picking overlevel loot to drop over usable loot.
             candidates = over_level if len(over_level) >= len(usable) else usable
             if log:
                 trace.append(f"over-level {len(over_level)} vs usable {len(usable)}")
@@ -1105,19 +1386,28 @@ def choose_worst_item(candidates, cap, caller, log=False, now=None):
             sizes = {label: len(group) for label, group in element_groups.items()}
             trace.append(f"element {sizes}")
 
-    if cap is not None and len(candidates) > 1:
-        candidates, diff = _tied_for_extreme(
-            candidates, lambda item: abs((item_level(item, caller) or 0) - cap), pick_max=True
+    # Only when every remaining candidate is actually unusable (over-level)
+    # does dropping the HIGHEST level one make sense - it is the one that
+    # takes longest to grow into. A usable group is left untouched here (no
+    # filter at all - "include everything for potential drop") rather than
+    # picking the one furthest from the character's level, which would have
+    # dropped a low-level usable item just for being far below the cap.
+    is_overlevel_group = cap is not None and all(
+        (item_level(item, caller) or 0) > cap for item in candidates
+    )
+    if is_overlevel_group and len(candidates) > 1:
+        candidates, level_value = _tied_for_extreme(
+            candidates, lambda item: item_level(item, caller) or 0, pick_max=True
         )
         if log:
-            trace.append(f"furthest from level ({diff})")
+            trace.append(f"highest level, unusable ({level_value})")
 
     if len(candidates) > 1:
-        candidates, rarity = _tied_for_extreme(
-            candidates, item_rarity, pick_max=False
+        candidates, score = _tied_for_extreme(
+            candidates, item_gearscore, pick_max=False
         )
         if log:
-            trace.append(f"rarity {rarity}")
+            trace.append(f"gearscore {score:.1f}")
 
     if len(candidates) > 1:
         candidates, price = _tied_for_extreme(
@@ -1550,6 +1840,7 @@ def player_tick(obj, _args, _ret, _func):
             logging.warning(f"[AutoLootBL1E] skipped a pickup: {ex!r}")
 
     use_backpack_extras(obj)
+    maybe_use_healing_kit(obj)
 
     active_this_pass = collected_any or freed_any_slot
     ticks_until_scan = FAST_SCAN_INTERVAL if active_this_pass else SCAN_INTERVAL
@@ -1600,6 +1891,7 @@ MOD_OPTIONS = [
     pickup_sdus,
     auto_use_artifacts,
     auto_use_sdus,
+    auto_use_healing_kit_at_health_percent,
     drop_lowest_when_full,
     auto_equip,
     switch_when_empty,
