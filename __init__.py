@@ -84,12 +84,66 @@ LOG_REPEAT_COOLDOWN = 30.0
 
 ticks_until_scan = 0
 active_last_pass = False
-next_near_loot_report = 0.0
 last_shown_body = None
 fire_held = False
 picking_up = False
 warned_remote_client = False
 _recent_log_messages: dict[str, float] = {}
+
+
+def is_remote_client(caller) -> bool:
+    """Whether this player is a network client, not the host/server.
+
+    Auto-equip (ReadyBackpackInventory) cannot be made to work here: on a
+    client it routes through a `reliable server function` RPC
+    (ServerReadyWeaponFromBackpack) that never actually lands - confirmed
+    2026-08-17 by a debounced, well-spaced series of requests over 2+
+    minutes that never landed once, and by temporary hooks showing identical
+    Role values between a working manual equip and a non-working
+    mod-triggered one, ruling out a Role/ownership mismatch as the cause.
+
+    IMPORTANT CORRECTION (2026-08-18): this is NOT a general "Python can't
+    trigger reliable server function RPCs on a client" limitation - that
+    was the working theory but it's disproven. ThrowBackpackInventory
+    (auto-drop, used to free a backpack slot) calls Python -> simulated
+    function -> reliable server function (ServerThrowWeaponFromBackpack) -
+    the EXACT same shape as ReadyBackpackInventory's call chain - and it
+    demonstrably WORKS as a client: confirmed both by the item's count
+    leaving the backpack AND STAYING GONE across multiple real drops in a
+    live session, and by the user directly confirming the thrown item
+    physically appears in the world afterward (the one check that actually
+    distinguishes "worked" from "silently destroyed", since local removal
+    happens unconditionally either way and looks identical from the
+    backpack's side alone). So whatever specifically breaks equip is not
+    "Python calls don't dispatch RPCs" in general - that part of the
+    original theory was wrong - it's something more specific to
+    ReadyBackpackInventory/ServerReadyWeaponFromBackpack that has not been
+    identified. Do not re-generalize the drop mechanism's safety to equip,
+    or vice versa, without separately verifying each one - see the
+    single-source-of-truth-per-call-site lesson this whole saga is an
+    example of. WorldInfo.Game is the same test already used for
+    auto-pickup, for the unrelated reason that Game is simply never
+    populated on a client at all.
+    """
+    return caller.WorldInfo.Game is None
+
+
+def warn_remote_client_once() -> None:
+    """Logged once per session, not every tick, since nothing about this
+    changes tick to tick - covers both auto-pickup/drop and auto-equip,
+    which fail for the same reason (see is_remote_client)."""
+    global warned_remote_client
+    if warned_remote_client:
+        return
+    warned_remote_client = True
+    logging.warning(
+        "[AutoLootBL1E] this player is a remote client, not the host -"
+        " WorldInfo.Game is never available here, so auto-pickup/drop"
+        " cannot run, and auto-equip's ReadyBackpackInventory RPC never"
+        " actually reaches the server from a client either (confirmed, not"
+        " just latency). Manual pickup and equip are unaffected. (Not"
+        " logged again this session.)"
+    )
 
 
 def log_throttled(now: float, message: str) -> None:
@@ -725,18 +779,25 @@ def choose_backup_slot_weapon(caller, inventory_manager, avoid_signatures):
     return random.choice(fresh or loaded)
 
 
-def refill_dry_backup_slots(caller):
+def refill_dry_backup_slots(caller) -> bool:
     """Swap a dry weapon in any slot but the active one for a loaded backpack one.
 
     Never touches the active slot - see the comment above first_empty_weapon_slot
     in the Willow2 AutoLoot for why readying a backpack weapon into the
     CURRENT slot is a different, more careful operation than this one.
+
+    Returns whether anything was actually equipped this call - used to
+    trigger the end-of-pass backpack summary the same way a pickup or drop
+    does, rather than on any periodic/proximity timer.
     """
     if not auto_equip.value:
-        return
+        return False
+    if is_remote_client(caller):
+        warn_remote_client_once()
+        return False
     inventory_manager = caller.GetPawnInventoryManager()
     if inventory_manager is None:
-        return
+        return False
 
     pawn = caller.Pawn
     current = None if pawn is None else pawn.Weapon
@@ -745,6 +806,7 @@ def refill_dry_backup_slots(caller):
     by_slot = equipped_weapons(caller)
     signatures = {slot: weapon_signature(weapon) for slot, weapon in by_slot.items()}
 
+    equipped_any = False
     for slot, weapon in by_slot.items():
         if slot == current_slot or has_ammo(weapon):
             continue
@@ -755,11 +817,13 @@ def refill_dry_backup_slots(caller):
                 continue
             inventory_manager.ReadyBackpackInventory(chosen, slot)
             signatures[slot] = weapon_signature(chosen)
+            equipped_any = True
         except Exception as ex:  # noqa: BLE001
             logging.warning(f"[AutoLootBL1E] could not refill backup slot {slot}: {ex!r}")
+    return equipped_any
 
 
-def diversify_equipped_elements(caller):
+def diversify_equipped_elements(caller) -> bool:
     """Swap one of a pair of equipped weapons sharing an element for a fresh one.
 
     Ported from willow2_mods/AutoLoot (this was meant to already be part of
@@ -778,11 +842,14 @@ def diversify_equipped_elements(caller):
     already returns for weapons (an ammo/type label like "Sniper Rifle").
     """
     if not auto_equip.value:
-        return
+        return False
+    if is_remote_client(caller):
+        warn_remote_client_once()
+        return False
 
     inventory_manager = caller.GetPawnInventoryManager()
     if inventory_manager is None:
-        return
+        return False
 
     pawn = caller.Pawn
     current = None if pawn is None else pawn.Weapon
@@ -794,6 +861,7 @@ def diversify_equipped_elements(caller):
     for slot, element in elements.items():
         by_element.setdefault(element, []).append(slot)
 
+    equipped_any = False
     for slots in by_element.values():
         if len(slots) < 2:
             continue
@@ -816,12 +884,14 @@ def diversify_equipped_elements(caller):
             chosen = random.choice(fresh)
             old_group = comparison_group(by_slot[slot])
             inventory_manager.ReadyBackpackInventory(chosen, slot)
+            equipped_any = True
             logging.warning(
                 f"[AutoLootBL1E] slot {slot}: {old_group} -> {comparison_group(chosen)},"
                 " no longer sharing an element with another slot"
             )
         except Exception as ex:  # noqa: BLE001
             logging.warning(f"[AutoLootBL1E] could not diversify slot {slot}: {ex!r}")
+    return equipped_any
 
 
 def manage_weapon_ammo(caller):
@@ -921,16 +991,20 @@ def is_worth_equipping(caller, item) -> bool:
     return False
 
 
-def fill_empty_equip_slots(caller):
+def fill_empty_equip_slots(caller) -> bool:
     if not auto_equip.value:
-        return
+        return False
+    if is_remote_client(caller):
+        warn_remote_client_once()
+        return False
     inventory_manager = caller.GetPawnInventoryManager()
     if inventory_manager is None:
-        return
+        return False
 
     candidates = [item for item in inventory_manager.Backpack if is_worth_equipping(caller, item)]
     random.shuffle(candidates)
 
+    equipped_any = False
     for item in candidates:
         try:
             kind = item_kind(item)
@@ -939,14 +1013,17 @@ def fill_empty_equip_slots(caller):
                 if slot is None:
                     continue
                 inventory_manager.ReadyBackpackInventory(item, slot)
+                equipped_any = True
             else:
                 # Re-check immediately before acting: an earlier item in this
                 # same pass may have just filled this exact slot.
                 if not gear_slot_is_empty(caller, kind):
                     continue
                 inventory_manager.ReadyBackpackInventory(item)
+                equipped_any = True
         except Exception as ex:  # noqa: BLE001
             logging.warning(f"[AutoLootBL1E] could not equip from the backpack: {ex!r}")
+    return equipped_any
 
 
 def dist(a, b) -> float:
@@ -1461,6 +1538,37 @@ def throw_backpack_item(caller, item) -> bool:
     return freed
 
 
+def free_worst_item_if_full(caller, cap, now) -> bool:
+    """Drop the worst backpack item whenever full, regardless of whether
+    anything nearby is about to be picked up.
+
+    The reactive check inside the pickup loop below only runs while
+    evaluating a SPECIFIC incoming candidate this mod itself tracks
+    (should_pickup-passing kinds) - a Healing Kit is a WillowUsableItem
+    with item_kind() None, so should_pickup() is always False for it and
+    that reactive check never even sees it, meaning a full backpack could
+    silently block a plain manual Healing Kit pickup with the mod never
+    reacting at all. "Drop Worst Item When Full" is documented simply as
+    "when full, drop whatever is worth least" - not "when full AND about to
+    pick something up" - so this makes the behaviour match its own
+    description: keep at most one slot's worth of "full" at a time,
+    independent of what's nearby.
+    """
+    if not drop_lowest_when_full.value:
+        return False
+    if not backpack_is_full(caller):
+        return False
+    candidates = droppable_backpack_items(caller)
+    worst = choose_worst_item(candidates, cap, caller, log=True, now=now)
+    if worst is None:
+        logging.warning(
+            "[AutoLootBL1E] backpack is full and nothing in it can be dropped"
+            " (all undroppable)"
+        )
+        return False
+    return throw_backpack_item(caller, worst)
+
+
 def backpack_tally(caller):
     inventory_manager = caller.GetPawnInventoryManager()
     if inventory_manager is None:
@@ -1582,17 +1690,8 @@ def attempt_pickup(caller, pickup) -> bool:
         # Game is always None here, and this used to throw AttributeError on
         # every single pickup attempt - once per candidate per scan tick,
         # spamming the log. Auto-pickup only works for the host until this
-        # has a real server-RPC path; logged once, not every tick, since
-        # nothing about this changes tick to tick.
-        global warned_remote_client
-        if not warned_remote_client:
-            warned_remote_client = True
-            logging.warning(
-                "[AutoLootBL1E] this player is a remote client, not the host -"
-                " WorldInfo.Game is never available here, so auto-pickup/drop"
-                " cannot run. Manual pickup is unaffected. (Not logged again"
-                " this session.)"
-            )
+        # has a real server-RPC path.
+        warn_remote_client_once()
         return False
     try:
         allowed = game.PickupQuery(caller.Pawn, pickup)
@@ -1666,7 +1765,7 @@ def world_has_settled(obj) -> bool:
 
 @hook("WillowGame.WillowPlayerController:PlayerTick", Type.POST)
 def player_tick(obj, _args, _ret, _func):
-    global ticks_until_scan, active_last_pass, next_near_loot_report
+    global ticks_until_scan, active_last_pass
 
     ticks_until_scan -= 1
     if ticks_until_scan > 0:
@@ -1680,12 +1779,20 @@ def player_tick(obj, _args, _ret, _func):
         ticks_until_scan = SCAN_INTERVAL
         return
 
+    equipped_any = False
     try:
         # Fill empty slots first, so a gun that lands in one is available to
-        # the dry-weapon logic below on this same pass.
-        fill_empty_equip_slots(obj)
-        refill_dry_backup_slots(obj)
-        diversify_equipped_elements(obj)
+        # the dry-weapon logic below on this same pass. Each returns whether
+        # it actually equipped something, so an equip triggers the same
+        # end-of-pass backpack summary a pickup or drop does - `if x: flag =
+        # True` rather than `flag = flag or x()` so all three always run
+        # regardless of what an earlier one returned.
+        if fill_empty_equip_slots(obj):
+            equipped_any = True
+        if refill_dry_backup_slots(obj):
+            equipped_any = True
+        if diversify_equipped_elements(obj):
+            equipped_any = True
         manage_weapon_ammo(obj)
     except Exception as ex:  # noqa: BLE001
         logging.warning(f"[AutoLootBL1E] could not manage equipment: {ex!r}")
@@ -1713,23 +1820,15 @@ def player_tick(obj, _args, _ret, _func):
     now = 0.0
     try:
         now = obj.WorldInfo.TimeSeconds
-        # nearby_pickups() is every WillowPickup in range, including ammo/
-        # health/currency drops we don't track at all - only a candidate this
-        # mod actually cares about (should_pickup) should trigger the "near
-        # loot" summary, not just standing near an ammo pile.
-        near_tracked_loot = any(
-            should_pickup(pickup.Inventory, obj)
-            for pickup in candidates
-            if pickup.Inventory is not None
-        )
-        if now >= next_near_loot_report and near_tracked_loot:
-            report_backpack(obj)
-            next_near_loot_report = now + hud_summary_seconds.value
     except Exception as ex:  # noqa: BLE001
-        logging.warning(f"[AutoLootBL1E] could not check for nearby loot: {ex!r}")
+        logging.warning(f"[AutoLootBL1E] could not read world time: {ex!r}")
 
     collected_any = False
-    freed_any_slot = False
+    try:
+        freed_any_slot = free_worst_item_if_full(obj, cap, now)
+    except Exception as ex:  # noqa: BLE001
+        logging.warning(f"[AutoLootBL1E] could not free a backpack slot: {ex!r}")
+        freed_any_slot = False
     have_cached_real_items = False
     cached_real_items = []
 
@@ -1842,18 +1941,21 @@ def player_tick(obj, _args, _ret, _func):
     use_backpack_extras(obj)
     maybe_use_healing_kit(obj)
 
-    active_this_pass = collected_any or freed_any_slot
+    active_this_pass = collected_any or freed_any_slot or equipped_any
     ticks_until_scan = FAST_SCAN_INTERVAL if active_this_pass else SCAN_INTERVAL
 
     # Report once the pile/cleanup is finished, not per item - same reasoning
-    # for both halves: show_hud_message drops messages shown too close
-    # together, so one line per pickup or drop would be unreadable anyway,
+    # for all three: show_hud_message drops messages shown too close
+    # together, so one line per pickup/equip/drop would be unreadable anyway,
     # and an active pass rescans on the very next tick, so the first quiet
     # pass lands almost immediately after the last active one. Used to only
     # watch collected_any, so a pass that only DROPPED something (freed_any_slot,
     # no pickup) never refreshed the summary at all - confirmed in play:
     # dropping an item to make room showed no updated summary until the next
-    # unrelated pickup happened to trigger one.
+    # unrelated pickup happened to trigger one. equipped_any was added for
+    # the same reason - this must fire on pickup, equip, OR drop, never on a
+    # periodic/proximity timer regardless of activity (that was the earlier,
+    # separate near-loot-proximity bug removed above).
     if active_this_pass:
         active_last_pass = True
     elif active_last_pass:
