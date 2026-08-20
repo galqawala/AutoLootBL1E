@@ -72,17 +72,34 @@ from unrealsdk import logging
 from unrealsdk.hooks import Block, Type
 import unrealsdk
 
-SCAN_INTERVAL = 20
-FAST_SCAN_INTERVAL = 1
+# SCAN_INTERVAL/FAST_SCAN_INTERVAL used to be raw TICK counts (20, 4),
+# implicitly assuming PlayerTick fires at ~60Hz (20 ticks =~ 0.33s). Measured
+# directly (2026-08-20): on this machine PlayerTick actually fires at close
+# to 400Hz, uniformly across the whole session (checked both right after
+# level load and right before the player quit, not just one sample) - this
+# game has no frame cap and runs far faster than 60fps on modern hardware.
+# At that real rate, "20 ticks" meant ~50ms, not ~330ms - so the mod's ~6ms
+# "did work" pass was running roughly every 50ms continuously, a steady
+# ~12% tax on the main thread for the entire session, not an occasional
+# cost. Expressed directly in real seconds instead, so the cadence stays
+# what it was actually meant to be regardless of how fast the engine
+# happens to be ticking on a given machine.
+SCAN_INTERVAL_SECONDS = 0.3
+FAST_SCAN_INTERVAL_SECONDS = 0.05
+# nearby_pickups() reads the tracked_pickups list (see below), not a global
+# engine scan, so it's cheap regardless of cadence - but the whole "did
+# work" block of player_tick runs at this cadence, not just the pickup
+# read, so the interval still matters for the equip-management/backpack
+# work done alongside it.
 # An unresolved candidate (e.g. an item correctly declined for taking the
-# last backpack slot) gets re-evaluated every tick for as long as it sits
-# there - correct, since its surroundings could change at any tick - but
-# re-logging the identical line every ~0.1s while nothing changes is pure
+# last backpack slot) gets re-evaluated every scan for as long as it sits
+# there - correct, since its surroundings could change at any scan - but
+# re-logging the identical line every scan while nothing changes is pure
 # spam. This only throttles which of those re-evaluations also produce a log
-# line; every tick still runs the real decision.
+# line; every scan still runs the real decision.
 LOG_REPEAT_COOLDOWN = 30.0
 
-ticks_until_scan = 0
+next_scan_at = 0.0
 active_last_pass = False
 last_shown_body = None
 fire_held = False
@@ -780,11 +797,28 @@ def choose_backup_slot_weapon(caller, inventory_manager, avoid_signatures):
 
 
 def refill_dry_backup_slots(caller) -> bool:
-    """Swap a dry weapon in any slot but the active one for a loaded backpack one.
+    """Swap a weapon with no RESERVE ammo left in any slot but the active one
+    for a loaded backpack one.
 
     Never touches the active slot - see the comment above first_empty_weapon_slot
     in the Willow2 AutoLoot for why readying a backpack weapon into the
     CURRENT slot is a different, more careful operation than this one.
+
+    Uses player_has_ammo_for (the player's shared reserve pool), NOT
+    has_ammo/HasAnyAmmo (the weapon's own current clip) - a backup slot's
+    weapon is never being fired, so its clip is expected to be empty or
+    near-empty; that is not a reason to swap it. Confirmed as a real,
+    self-inflicted bug (2026-08-20): ServerReadyWeaponFromBackpack sets
+    NewWeapon.StoredAmmo = 0 unconditionally on every equip, so a swap made
+    on the has_ammo() reading immediately produced ANOTHER "dry" weapon by
+    this mod's own doing, forever - measured directly as `active=True`
+    never reverting to the slow scan interval, and `equip` timing climbing
+    to ~17-18ms every single scan, reported by the user as lag "chopping
+    like once a second." loaded_backpack_weapons/choose_backup_slot_weapon
+    already use player_has_ammo_for for backpack CANDIDATES; this brings
+    the check on the EQUIPPED slot being replaced into line with the same
+    signal instead of mixing in a clip-based one that only means anything
+    for the actively-held weapon.
 
     Returns whether anything was actually equipped this call - used to
     trigger the end-of-pass backpack summary the same way a pickup or drop
@@ -808,7 +842,7 @@ def refill_dry_backup_slots(caller) -> bool:
 
     equipped_any = False
     for slot, weapon in by_slot.items():
-        if slot == current_slot or has_ammo(weapon):
+        if slot == current_slot or player_has_ammo_for(caller, weapon):
             continue
         try:
             avoid = {sig for other_slot, sig in signatures.items() if other_slot != slot}
@@ -1637,21 +1671,67 @@ def report_backpack(caller):
         logging.warning(f"[AutoLootBL1E] could not summarise the backpack: {ex!r}")
 
 
-def nearby_pickups(view_location, max_dist):
-    """Every live WillowPickup within range, as a plain list.
+# unrealsdk.find_all("WillowPickup") is a global scan of every pickup actor
+# currently loaded in the level, not a proximity search - and measured in
+# play (2026-08-20), its cost is NOT constant: it grew from ~2-5ms to ~44ms
+# over a couple of minutes while candidates=0 the whole time (nothing even
+# near the player), meaning the cost tracks the TOTAL pool of WillowPickup
+# objects that have accumulated in the level, not activity. Calling it on
+# every scan - even a throttled one - means that growth compounds into
+# steadily worsening frame hitches for as long as the session runs.
+#
+# Fixed by maintaining our own list instead of re-querying the engine every
+# scan: WillowPickup.InitializeFromInventory and .Destroyed are both
+# directly declared on WillowPickup itself (confirmed in the BL1E dump, not
+# assumed from a sibling game) and are the exact moments a pickup gains real
+# content and later leaves existence for ANY reason (picked up by us,
+# picked up by a coop teammate, or expired) - so hooking both keeps this
+# list accurate without ever walking the full level pool again. One find_all
+# call still happens, but only ONCE per level load (see
+# _seed_tracked_pickups, called from world_has_settled) to pick up whatever
+# was already on the ground before this mod's hooks existed - not on every
+# scan.
+tracked_pickups: list = []
 
-    unrealsdk.find_all is a global scan across the whole level, not a
-    proximity search (same caveat documented in EnemyBalancer) - the distance
-    filter here is what narrows it down, exactly mirroring how AutoLoot
-    filtered willow_globals.PickupList by distance in Willow2.
-    """
+
+@hook("WillowGame.WillowPickup:InitializeFromInventory", Type.POST)
+def on_pickup_initialized(obj, _args, _ret, _func):
+    if obj not in tracked_pickups:
+        tracked_pickups.append(obj)
+
+
+@hook("WillowGame.WillowPickup:Destroyed", Type.PRE)
+def on_pickup_destroyed(obj, _args, _ret, _func):
+    # PRE, not POST - remove the reference before the engine tears the
+    # object down, not after (see the rule on never reading from an object
+    # an API may have already destroyed). Identity removal via a list
+    # comprehension rather than .remove(), which would need __eq__ to work
+    # the way we want on a wrapped UObject.
+    global tracked_pickups
+    tracked_pickups = [p for p in tracked_pickups if p is not obj]
+
+
+def _seed_tracked_pickups(reason: str) -> None:
+    global tracked_pickups
     try:
-        candidates = list(unrealsdk.find_all("WillowPickup"))
+        tracked_pickups = list(unrealsdk.find_all("WillowPickup"))
     except Exception as ex:  # noqa: BLE001
-        logging.warning(f"[AutoLootBL1E] find_all('WillowPickup') failed: {ex!r}")
-        return []
+        logging.warning(f"[AutoLootBL1E] could not seed tracked pickups: {ex!r}")
+        tracked_pickups = []
+        return
+    logging.info(
+        f"[AutoLootBL1E] seeded {len(tracked_pickups)} tracked pickups ({reason})"
+    )
+
+
+def nearby_pickups(view_location, max_dist):
+    """Every live, tracked WillowPickup within range, as a plain list.
+
+    See the tracked_pickups comment above - this used to call
+    unrealsdk.find_all("WillowPickup") directly, every single scan.
+    """
     result = []
-    for pickup in candidates:
+    for pickup in tracked_pickups:
         try:
             if pickup.Inventory is None:
                 continue
@@ -1741,15 +1821,23 @@ def attempt_pickup(caller, pickup) -> bool:
 # join just happen".
 last_world_info = None
 world_settled_at = None
+pickups_seeded_this_world = False
 TRANSITION_GRACE_SECONDS = 10.0
 
 
 def world_has_settled(obj) -> bool:
-    global last_world_info, world_settled_at
+    global last_world_info, world_settled_at, pickups_seeded_this_world
     world_info = obj.WorldInfo
     if world_info is not last_world_info:
         last_world_info = world_info
         world_settled_at = None
+        pickups_seeded_this_world = False
+        # Stale references from the level that just unloaded - the engine
+        # has already destroyed them (our own Destroyed hook may not have
+        # caught all of them if the mod was disabled, or this is the very
+        # first tick after the SDK itself loaded), so drop them now rather
+        # than carry dead objects until the new level's seed replaces them.
+        tracked_pickups.clear()
     try:
         now = world_info.TimeSeconds
     except Exception:  # noqa: BLE001
@@ -1760,23 +1848,30 @@ def world_has_settled(obj) -> bool:
             f"[AutoLootBL1E] new world/session detected - pausing all"
             f" pickups/drops/equips for {TRANSITION_GRACE_SECONDS:.0f}s while it settles"
         )
-    return now >= world_settled_at
+    settled = now >= world_settled_at
+    if settled and not pickups_seeded_this_world:
+        pickups_seeded_this_world = True
+        _seed_tracked_pickups("new world settled")
+    return settled
 
 
 @hook("WillowGame.WillowPlayerController:PlayerTick", Type.POST)
 def player_tick(obj, _args, _ret, _func):
-    global ticks_until_scan, active_last_pass
+    global next_scan_at, active_last_pass
 
-    ticks_until_scan -= 1
-    if ticks_until_scan > 0:
+    try:
+        now = obj.WorldInfo.TimeSeconds
+    except Exception:  # noqa: BLE001
+        return
+    if now < next_scan_at:
         return
 
     if obj.Pawn is None:
-        ticks_until_scan = SCAN_INTERVAL
+        next_scan_at = now + SCAN_INTERVAL_SECONDS
         return
 
     if not world_has_settled(obj):
-        ticks_until_scan = SCAN_INTERVAL
+        next_scan_at = now + SCAN_INTERVAL_SECONDS
         return
 
     equipped_any = False
@@ -1807,21 +1902,13 @@ def player_tick(obj, _args, _ret, _func):
         )
     except Exception as ex:  # noqa: BLE001
         logging.warning(f"[AutoLootBL1E] could not read pickup range: {ex!r}")
-        ticks_until_scan = SCAN_INTERVAL
+        next_scan_at = now + SCAN_INTERVAL_SECONDS
         return
 
     view_location = obj.CalcViewActorLocation
     cap = character_level(obj)
 
     candidates = nearby_pickups(view_location, max_dist)
-
-    # Default in case the try below fails before assigning it - now is also
-    # used later, for log throttling, well outside this try/except.
-    now = 0.0
-    try:
-        now = obj.WorldInfo.TimeSeconds
-    except Exception as ex:  # noqa: BLE001
-        logging.warning(f"[AutoLootBL1E] could not read world time: {ex!r}")
 
     collected_any = False
     try:
@@ -1942,7 +2029,7 @@ def player_tick(obj, _args, _ret, _func):
     maybe_use_healing_kit(obj)
 
     active_this_pass = collected_any or freed_any_slot or equipped_any
-    ticks_until_scan = FAST_SCAN_INTERVAL if active_this_pass else SCAN_INTERVAL
+    next_scan_at = now + (FAST_SCAN_INTERVAL_SECONDS if active_this_pass else SCAN_INTERVAL_SECONDS)
 
     # Report once the pile/cleanup is finished, not per item - same reasoning
     # for all three: show_hud_message drops messages shown too close

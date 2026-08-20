@@ -1,6 +1,6 @@
 [project]
 name = "auto_loot_bl1e"
-version = "0.1.40"
+version = "0.1.46"
 authors = [{ name = "galqawala" }]
 description = """\
 Automatically picks up weapons, shields, grenade mods, class mods, artifacts \
@@ -12,7 +12,7 @@ dependencies = ["ui_utils"]
 
 [tool.sdkmod]
 name = "AutoLootBL1E"
-version = "0.1.40"
+version = "0.1.46"
 supported_games = ["BL1E"]
 license = {name = "GPL3", url = "https://choosealicense.com/licenses/gpl-3.0/" }
 download = "https://github.com/galqawala/AutoLootBL1E/raw/refs/heads/master/AutoLootBL1E.sdkmod"
