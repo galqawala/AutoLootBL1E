@@ -70,6 +70,7 @@ from mods_base import BoolOption, DropdownOption, SliderOption, build_mod, hook
 from ui_utils import show_hud_message
 from unrealsdk import logging
 from unrealsdk.hooks import Block, Type
+from unrealsdk.unreal import WeakPointer
 import unrealsdk
 
 # SCAN_INTERVAL/FAST_SCAN_INTERVAL used to be raw TICK counts (20, 4),
@@ -1691,30 +1692,46 @@ def report_backpack(caller):
 # _seed_tracked_pickups, called from world_has_settled) to pick up whatever
 # was already on the ground before this mod's hooks existed - not on every
 # scan.
-tracked_pickups: list = []
+#
+# Stored as WeakPointer, not raw objects - the Destroyed hook is the primary
+# removal path, but it is not the *only* way a pickup can stop existing
+# (level streaming unloading a sublevel, or an edge case in how a
+# teammate's pickup gets removed, could plausibly tear one down without
+# routing through this exact hooked function). A raw reference left
+# dangling after any such miss is a native GPF waiting to happen the next
+# time nearby_pickups() reads a field off it - confirmed as the actual cause
+# of a crash in play (2026-08-21): the crash's own call-in-progress log
+# showed this mod's PlayerTick hook had started and never returned, and the
+# native fault trace was a property-getter call chain, both consistent with
+# dereferencing a stale actor rather than a Python-level bug. WeakPointer()
+# resolves to None instead of a dangling pointer once the underlying object
+# is actually gone, which is safe to call from inside a hook (the SDK's own
+# docs: GC doesn't run mid-hook), and nearby_pickups() below drops and
+# opportunistically prunes anything that resolves to None.
+tracked_pickups: list = []  # list[WeakPointer]
 
 
 @hook("WillowGame.WillowPickup:InitializeFromInventory", Type.POST)
 def on_pickup_initialized(obj, _args, _ret, _func):
-    if obj not in tracked_pickups:
-        tracked_pickups.append(obj)
+    if not any(wp() is obj for wp in tracked_pickups):
+        tracked_pickups.append(WeakPointer(obj))
 
 
 @hook("WillowGame.WillowPickup:Destroyed", Type.PRE)
 def on_pickup_destroyed(obj, _args, _ret, _func):
     # PRE, not POST - remove the reference before the engine tears the
     # object down, not after (see the rule on never reading from an object
-    # an API may have already destroyed). Identity removal via a list
-    # comprehension rather than .remove(), which would need __eq__ to work
-    # the way we want on a wrapped UObject.
+    # an API may have already destroyed). Resolves each weak pointer to
+    # compare by identity, same reasoning as before (a wrapped UObject's
+    # __eq__ doesn't do what we want here).
     global tracked_pickups
-    tracked_pickups = [p for p in tracked_pickups if p is not obj]
+    tracked_pickups = [wp for wp in tracked_pickups if wp() is not obj]
 
 
 def _seed_tracked_pickups(reason: str) -> None:
     global tracked_pickups
     try:
-        tracked_pickups = list(unrealsdk.find_all("WillowPickup"))
+        tracked_pickups = [WeakPointer(p) for p in unrealsdk.find_all("WillowPickup")]
     except Exception as ex:  # noqa: BLE001
         logging.warning(f"[AutoLootBL1E] could not seed tracked pickups: {ex!r}")
         tracked_pickups = []
@@ -1731,7 +1748,16 @@ def nearby_pickups(view_location, max_dist):
     unrealsdk.find_all("WillowPickup") directly, every single scan.
     """
     result = []
-    for pickup in tracked_pickups:
+    still_live = []
+    for wp in tracked_pickups:
+        pickup = wp()
+        if pickup is None:
+            # Already gone - the Destroyed hook missed this one (or hasn't
+            # run yet this tick), but WeakPointer resolving to None means
+            # there is nothing here to dereference. Drop it from the list
+            # instead of carrying a permanently-dead entry.
+            continue
+        still_live.append(wp)
         try:
             if pickup.Inventory is None:
                 continue
@@ -1742,6 +1768,8 @@ def nearby_pickups(view_location, max_dist):
         except Exception:  # noqa: BLE001
             continue
         result.append(pickup)
+    if len(still_live) != len(tracked_pickups):
+        tracked_pickups[:] = still_live
     return result
 
 
